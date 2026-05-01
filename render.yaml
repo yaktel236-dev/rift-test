@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: rift-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python rift_bot.py
