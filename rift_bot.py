@@ -17,11 +17,13 @@ PLACE_ID = 13358463560
 WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
 RIFT_INTERVAL = 90 * 60
-CHECK_DELAY = 180
+CHECK_DELAY = 600
 RIFT_WINDOW = 5 * 60
-RIFT_GRACE_AFTER = 10 * 60
-PAGE_DELAY = 1.0
-RATE_LIMIT_DELAY = 300
+RIFT_GRACE_AFTER = 30 * 60
+PAGE_DELAY = 3.0
+RATE_LIMIT_DELAY = 1800
+DISCORD_RATE_LIMIT_FALLBACK = 1800
+MAX_RIFTS_PER_DISCORD_MESSAGE = 8
 
 # If False, servers found on the first scan are saved as baseline only.
 # This avoids fake "new server" times for servers that existed before bot start.
@@ -32,13 +34,18 @@ DB_FILE = SCRIPT_DIR / "servers.json"
 BACKUP_DB_FILE = SCRIPT_DIR / "servers_backup.json"
 
 app = Flask(__name__)
+discord_blocked_until = 0
 bot_status = {
     "started": False,
     "last_check": "never",
     "last_error": "",
     "checked_servers": 0,
+    "tracked_new_servers": 0,
+    "baseline_servers": 0,
     "candidates": 0,
     "sent": 0,
+    "nearest_rift": "",
+    "nearest_server_id": "",
 }
 
 
@@ -113,13 +120,21 @@ def get_servers():
     return servers
 
 
-def send_webhook(content):
+def send_webhook_payload(payload):
+    global discord_blocked_until
+
     if not WEBHOOK_URL:
         log("[DISCORD] Webhook is empty. Message was not sent.")
         return False
 
+    now = time.time()
+    if now < discord_blocked_until:
+        wait_for = int(discord_blocked_until - now)
+        log(f"[DISCORD] Rate limited. Skipping send for {wait_for}s.")
+        return False
+
     try:
-        response = requests.post(WEBHOOK_URL, json={"content": content}, timeout=20)
+        response = requests.post(WEBHOOK_URL, json=payload, timeout=20)
     except requests.RequestException as error:
         log(f"[DISCORD] Request failed: {error}")
         return False
@@ -127,8 +142,26 @@ def send_webhook(content):
     if response.status_code in (200, 204):
         return True
 
+    if response.status_code == 429:
+        retry_after = response.headers.get("Retry-After")
+        try:
+            retry_after = float(retry_after) if retry_after else float(response.json().get("retry_after", 0))
+        except (ValueError, TypeError, json.JSONDecodeError):
+            retry_after = 0
+
+        if retry_after <= 0:
+            retry_after = DISCORD_RATE_LIMIT_FALLBACK
+
+        discord_blocked_until = time.time() + retry_after
+        log(f"[DISCORD] Rate limited. Waiting {int(retry_after)}s before next send.")
+        return False
+
     log(f"[DISCORD] Error {response.status_code}: {response.text[:300]}")
     return False
+
+
+def send_webhook(content):
+    return send_webhook_payload({"content": content})
 
 
 def format_time(seconds):
@@ -167,6 +200,60 @@ def normalize_record(record, now):
     return make_record(now)
 
 
+def build_rift_embed(server_id, rift_time, age, players, mode):
+    roblox_link = f"https://www.roblox.com/games/{PLACE_ID}?gameId={server_id}"
+    direct_join_link = f"https://l.rlnk.app/g/{PLACE_ID}/{server_id}"
+    roblox_protocol = f"roblox://placeId={PLACE_ID}&gameInstanceId={server_id}"
+
+    if mode == "incoming":
+        target_time = format_time(rift_time)
+        description = "This server hit a Rift time window."
+    else:
+        target_time = f"active, started {format_time(rift_time)} ago"
+        description = "This Rift should be active right now."
+
+    return {
+        "title": "Server Found!",
+        "description": description,
+        "color": 5763719,
+        "fields": [
+            {
+                "name": "Uptime",
+                "value": f"`{format_time(age)}`",
+                "inline": True,
+            },
+            {
+                "name": "Target Time",
+                "value": f"`{target_time}`",
+                "inline": True,
+            },
+            {
+                "name": "Players",
+                "value": f"`{players}`",
+                "inline": True,
+            },
+            {
+                "name": "Direct Join",
+                "value": f"`{roblox_protocol}`\n[Backup join link]({direct_join_link})",
+                "inline": False,
+            },
+            {
+                "name": "Roblox Page",
+                "value": f"[Open game page]({roblox_link})",
+                "inline": False,
+            },
+            {
+                "name": "Job ID",
+                "value": f"`{server_id}`",
+                "inline": False,
+            },
+        ],
+        "footer": {
+            "text": "Rift Tracker Bot",
+        },
+    }
+
+
 def run_bot():
     bot_status["started"] = True
 
@@ -178,12 +265,7 @@ def run_bot():
     db = load_db()
     first_scan = not bool(db)
 
-    log("Bot started. Checking Discord webhook...")
-    if send_webhook("Rift bot started. Discord webhook works."):
-        log("[DISCORD] Test message sent.")
-    else:
-        log("[DISCORD] Test message failed. Check webhook URL.")
-
+    log("Bot started.")
     log("Tracking Roblox servers...")
 
     while True:
@@ -193,6 +275,8 @@ def run_bot():
             active_ids = set()
             candidates = []
             nearest = []
+            tracked_new_servers = 0
+            baseline_servers = 0
 
             for server in servers:
                 server_id = server.get("id")
@@ -216,8 +300,10 @@ def run_bot():
                 db[server_id] = record
 
                 if record.get("baseline"):
+                    baseline_servers += 1
                     continue
 
+                tracked_new_servers += 1
                 age = now - float(record["first_seen"])
                 cycle = int(age // RIFT_INTERVAL)
                 phase = age % RIFT_INTERVAL
@@ -245,35 +331,31 @@ def run_bot():
             nearest.sort(key=lambda item: item[0])
 
             sent = 0
-            for server_id, rift_time, age, notify_cycle, players, mode in candidates[:5]:
+            notification_items = []
+            embeds = []
+
+            for server_id, rift_time, age, notify_cycle, players, mode in candidates[:MAX_RIFTS_PER_DISCORD_MESSAGE]:
                 record = normalize_record(db[server_id], now)
                 if record.get("last_notified_cycle") == notify_cycle:
                     continue
 
-                roblox_link = f"https://www.roblox.com/games/{PLACE_ID}?gameId={server_id}"
-                direct_join_link = f"https://l.rlnk.app/g/{PLACE_ID}/{server_id}"
-                if mode == "incoming":
-                    title = "Rift incoming!"
-                    timing = f"Rift in: {format_time(rift_time)}"
-                else:
-                    title = "Rift should be active now!"
-                    timing = f"Rift started about: {format_time(rift_time)} ago"
+                embeds.append(build_rift_embed(server_id, rift_time, age, players, mode))
+                notification_items.append((server_id, notify_cycle))
 
-                message = (
-                    f"{title}\n\n"
-                    f"Uptime from first bot sighting: {format_time(age)}\n"
-                    f"{timing}\n"
-                    f"Players: {players}\n"
-                    f"Direct join: {direct_join_link}\n"
-                    f"Roblox page: {roblox_link}\n"
-                    f"Server ID: {server_id}"
-                )
+            if embeds:
+                payload = {
+                    "content": "@everyone ⚡ Rift Incoming!",
+                    "allowed_mentions": {"parse": ["everyone"]},
+                    "embeds": embeds,
+                }
 
-                if send_webhook(message):
-                    record["last_notified_cycle"] = notify_cycle
-                    db[server_id] = record
-                    sent += 1
-                    log(f"[SENT] {server_id}")
+                if send_webhook_payload(payload):
+                    for server_id, notify_cycle in notification_items:
+                        record = normalize_record(db[server_id], now)
+                        record["last_notified_cycle"] = notify_cycle
+                        db[server_id] = record
+                        sent += 1
+                        log(f"[SENT] {server_id}")
 
             save_db(db)
             first_scan = False
@@ -281,6 +363,8 @@ def run_bot():
             bot_status["last_check"] = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
             bot_status["last_error"] = ""
             bot_status["checked_servers"] = len(active_ids)
+            bot_status["tracked_new_servers"] = tracked_new_servers
+            bot_status["baseline_servers"] = baseline_servers
             bot_status["candidates"] = len(candidates)
             bot_status["sent"] = sent
 
@@ -290,11 +374,15 @@ def run_bot():
             )
             if nearest:
                 seconds_to_rift, server_id, age, players = nearest[0]
+                bot_status["nearest_rift"] = format_time(seconds_to_rift)
+                bot_status["nearest_server_id"] = server_id
                 log(
                     f"Nearest tracked rift: {format_time(seconds_to_rift)} | "
                     f"Uptime: {format_time(age)} | Players: {players} | {server_id}"
                 )
             else:
+                bot_status["nearest_rift"] = ""
+                bot_status["nearest_server_id"] = ""
                 log("No tracked non-baseline servers yet.")
             time.sleep(CHECK_DELAY)
 
